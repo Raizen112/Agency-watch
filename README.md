@@ -42,12 +42,12 @@ Au sein de la Direction Commerciale de la région, le pilotage de la performance
 ├── python/
 │   ├── layer0_data_prep/       # Génération et anonymisation des données
 │   └── layer1_pipeline/        # Nettoyage, restructuration, calcul des KPIs
-├── knime/
-│   └── credit_prediction.knwf  # Workflow KNIME (Random Forest / H2O)
 ├── powerbi/
-│   └── dashboard.pbix          # Tableau de bord (5 pages)
+│   └── Layer_2_PowerBi.pbix       # Tableau de bord (5 pages)
+├── knime/
+│   └── Layer_3_Knime_workflow.knwf  # Workflow KNIME (Random Forest / H2O)
 ├── n8n/
-│   └── weekly_alert_workflow.json
+│   └── Layer_4_n8n_workflow.json
 ├── docs/
 │   ├── rapport_pfa.pdf         # Rapport complet
 │   └── screenshots/            # Captures du dashboard, du workflow, etc.
@@ -56,11 +56,8 @@ Au sein de la Direction Commerciale de la région, le pilotage de la performance
 
 ## 🛠️ Stack technique
 
-Python · pandas · scikit-learn · Power BI · KNIME Analytics Platform · H2O AutoML · n8n · Ollama (LLaMA 3.2) · Gmail API
+Python · pandas · Power BI · KNIME Analytics Platform · H2O AutoML · n8n · Ollama (LLaMA 3.2) · Gmail API
 
-## 📄 Rapport complet
-
-Le rapport détaillé (contexte, méthodologie, analyse des causes, résultats) est disponible dans [`docs/rapport_pfa.pdf`](docs/rapport_pfa.pdf).
 
 ## 👤 Auteur
 
