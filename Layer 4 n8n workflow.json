@@ -1,0 +1,243 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "86f465a3-fdf9-4f35-8570-d5528d65236e",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "fileSelector": "/home/node/.n8n-files/PFA/Prediction Workflow PFA H2O.xlsx",
+        "options": {
+          "dataPropertyName": "data"
+        }
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        208,
+        0
+      ],
+      "id": "f79d59d3-5bfd-4452-90cf-80ec9858695d",
+      "name": "Read/Write Files from Disk"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE: Code in JavaScript  (VERSION MISE À JOUR)\n// Regroupe les 34 lignes (17 agences x 2 types de crédit),\n// calcule la probabilité moyenne d'atteinte de l'objectif par\n// agence, détermine la catégorie (En bonne voie / A risque /\n// En danger), identifie la meilleure et la moins bonne agence,\n// et prépare un prompt où le LLM ne génère QUE les 3 lignes de\n// recommandations.\n//\n// Changements vs version précédente :\n// - Aucun changement de logique de calcul (seuils, moyennes,\n//   tri) : c'était déjà correct et vérifié contre les données.\n// - Renommage interne \"confiance\" -> reste \"confiance\" en code\n//   (pour ne rien casser en aval) mais le prompt LLM et les\n//   commentaires utilisent désormais le terme métier\n//   \"probabilité d'atteinte de l'objectif\".\n// - \"details\" par agence garanti trié Consommation puis\n//   Immobilier, pour un affichage de tableau prévisible dans\n//   le Code node 2.\n// ============================================================\n\nconst items = $input.all();\n\nif (!items || items.length === 0) {\n  throw new Error('Aucune donnée reçue en entrée (items vide).');\n}\n\nconst CREDIT_MAP = { 0: 'Consommation', 1: 'Immobilier' };\nconst CREDIT_ORDER = ['Consommation', 'Immobilier']; // ordre d'affichage garanti\n\n// Seuils de classement (modifiables ici uniquement)\nconst SEUIL_BONNE_VOIE = 70; // probabilité moyenne >= 70          -> \"En bonne voie\"\nconst SEUIL_RISQUE     = 40; // 40 <= probabilité moyenne < 70     -> \"A risque\"\n                              // probabilité moyenne < 40           -> \"En danger\"\n\n// --- 1. Regrouper les lignes par agence ---\nconst agenceGroups = {};\n\nitems.forEach((item, idx) => {\n  const data = item.json || {};\n\n  if (!('AGENCE' in data)) {\n    throw new Error(`Ligne ${idx} : champ \"AGENCE\" manquant.`);\n  }\n\n  const agenceRaw = data['AGENCE'];\n  let agenceIndex; // index brut (0-based), utilisé pour trier\n  let agenceNum;   // numéro affiché dans le rapport (1-based)\n\n  if (typeof agenceRaw === 'string' && /AGENCE/i.test(agenceRaw)) {\n    // Format déjà \"AGENCE 1\", \"Agence 5\", etc. -> on extrait le numéro tel quel,\n    // pas d'ajout de +1 car il est déjà au format d'affichage.\n    const match = agenceRaw.match(/(\\d+)/);\n    if (!match) {\n      throw new Error(`Ligne ${idx} : AGENCE=\"${agenceRaw}\" ne contient aucun numéro.`);\n    }\n    agenceNum = parseInt(match[1], 10);\n    agenceIndex = agenceNum - 1;\n  } else {\n    // Format brut : nombre (0, 1, 2...) -> on ajoute 1 pour l'affichage.\n    agenceIndex = parseInt(agenceRaw, 10);\n    if (isNaN(agenceIndex)) {\n      throw new Error(`Ligne ${idx} : AGENCE=\"${agenceRaw}\" n'est pas un nombre valide.`);\n    }\n    agenceNum = agenceIndex + 1; // index+1 : AGENCE 0 (fichier) -> \"AGENCE 1\" (rapport)\n  }\n\n  const agenceLabel = `AGENCE ${agenceNum}`;\n\n  const creditTypeRaw = parseInt(data['Credit_Type'], 10);\n  const creditLabel = CREDIT_MAP[creditTypeRaw] !== undefined ? CREDIT_MAP[creditTypeRaw] : 'Inconnu';\n\n  // Le nom de cette colonne a varié selon les exports H2O :\n  // ancien format : \"P (Hit_Objective=1)Probability\"\n  // nouveau format : \"P (Hit_Objective=Yes)Probability\"\n  const probaRaw = parseFloat(\n    data['P (Hit_Objective=Yes)Probability'] ??\n    data['P (Hit_Objective=1)Probability']\n  );\n  const confiance = isNaN(probaRaw) ? 0 : Math.round(probaRaw * 1000) / 10; // en %, 1 décimale\n\n  // \"Statut_Predit\" n'existe pas dans tous les exports : on le reconstruit\n  // à partir de \"Prediction (Hit_Objective)\" si besoin ('Yes'/'No' ou '1'/'0').\n  const predictionRaw = String(data['Prediction (Hit_Objective)'] ?? '').trim();\n  let statut = data['Statut_Predit'];\n  if (!statut) {\n    if (predictionRaw === 'Yes' || predictionRaw === '1') statut = '🟢 On Track';\n    else if (predictionRaw === 'No' || predictionRaw === '0') statut = '🔴 Will Miss';\n    else statut = 'Inconnu';\n  }\n\n  const objectifRaw = parseInt(data['OBJECTIF_Mensuel'], 10);\n  const objectif = isNaN(objectifRaw) ? 0 : objectifRaw;\n\n  if (!agenceGroups[agenceLabel]) {\n    agenceGroups[agenceLabel] = { agence: agenceLabel, agenceIndex, details: [] };\n  }\n\n  agenceGroups[agenceLabel].details.push({ credit_type: creditLabel, confiance, statut, objectif });\n});\n\n// --- 2. Calculer la probabilité moyenne et la catégorie par agence ---\nfunction determinerCategorie(confianceMoyenne) {\n  if (confianceMoyenne >= SEUIL_BONNE_VOIE) return 'En bonne voie';\n  if (confianceMoyenne >= SEUIL_RISQUE) return 'A risque';\n  return 'En danger';\n}\n\nconst agences = Object.values(agenceGroups)\n  .sort((a, b) => a.agenceIndex - b.agenceIndex) // ordre stable : AGENCE 1, 2, 3...\n  .map(g => {\n    // Trier les détails dans un ordre d'affichage fixe (Consommation puis Immobilier)\n    const detailsTries = [...g.details].sort(\n      (a, b) => CREDIT_ORDER.indexOf(a.credit_type) - CREDIT_ORDER.indexOf(b.credit_type)\n    );\n    const total = g.details.reduce((sum, d) => sum + d.confiance, 0);\n    const confianceMoyenne = Math.round((total / g.details.length) * 10) / 10;\n    return {\n      agence: g.agence,\n      confiance_moyenne: confianceMoyenne,\n      categorie: determinerCategorie(confianceMoyenne),\n      details: detailsTries\n    };\n  });\n\nif (agences.length === 0) {\n  throw new Error('Aucune agence trouvée après regroupement.');\n}\n\n// --- 3. Compter les catégories ---\nconst onTrack  = agences.filter(a => a.categorie === 'En bonne voie');\nconst atRisk   = agences.filter(a => a.categorie === 'A risque');\nconst enDanger = agences.filter(a => a.categorie === 'En danger');\n\n// --- 4. Meilleure et moins bonne agence ---\nconst sortedByConfiance = [...agences].sort((a, b) => b.confiance_moyenne - a.confiance_moyenne);\nconst best = sortedByConfiance[0];\nconst worst = sortedByConfiance[sortedByConfiance.length - 1];\n\n// --- 5. Bloc de données lisible (utile pour debug/inspection) ---\nconst dataBlock =\n`- Agences en bonne voie : ${onTrack.length}\n- Agences à risque : ${atRisk.length}\n- Agences en danger : ${enDanger.length}\n- Meilleure agence : ${best.agence} (probabilité d'atteinte objectif : ${best.confiance_moyenne}%)\n- Agence à surveiller : ${worst.agence} (probabilité d'atteinte objectif : ${worst.confiance_moyenne}%)`;\n\n// --- 6. Prompt envoyé au LLM : UNIQUEMENT les 3 recommandations ---\n// Le LLM ne voit jamais les chiffres globaux, le tableau complet, ni le\n// format du rapport : il ne peut donc ni les modifier ni les halluciner.\nconst prompt =\n`Tu es un assistant qui rédige UNIQUEMENT 3 lignes de recommandations pour un rapport bancaire interne. Tu ne fais rien d'autre.\n\nContexte (ne pas le répéter dans ta réponse) :\n- Meilleure agence : ${best.agence}, probabilité d'atteinte de l'objectif ${best.confiance_moyenne}%\n- Agence à surveiller en priorité : ${worst.agence}, probabilité d'atteinte de l'objectif ${worst.confiance_moyenne}%\n\nConsignes strictes, à respecter absolument :\n1. Réponds UNIQUEMENT avec exactement 3 lignes, chacune commençant par \"- \".\n2. N'écris RIEN avant ou après ces 3 lignes : pas de titre, pas d'introduction, pas de conclusion, pas d'explication, pas de markdown.\n3. N'utilise QUE ces deux noms d'agence, aucun autre nom, aucune autre banque : \"${best.agence}\" et \"${worst.agence}\".\n4. Ligne 1 : une recommandation concrète pour améliorer la situation de ${worst.agence}.\n5. Ligne 2 : une deuxième recommandation concrète et différente de la ligne 1, pour ${worst.agence}.\n6. Ligne 3 : une recommandation pour maintenir le bon niveau de ${best.agence}.\n7. Chaque ligne = une seule phrase claire et professionnelle, en français.\n\nRéponds maintenant avec uniquement les 3 lignes :`;\n\n// --- 7. Sortie ---\nreturn [{\n  json: {\n    total_agences: agences.length,\n    total_on_track: onTrack.length,\n    total_at_risk: atRisk.length,\n    total_en_danger: enDanger.length,\n    best_agence: best.agence,\n    best_confiance: best.confiance_moyenne,\n    worst_agence: worst.agence,\n    worst_confiance: worst.confiance_moyenne,\n    data_block: dataBlock,\n    prompt: prompt,\n    agences: agences\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        576,
+        0
+      ],
+      "id": "a282a6dc-c1de-42e1-af45-4bac2785fa10",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        400,
+        0
+      ],
+      "id": "3ea1d73e-0548-474e-9c77-843279e41efb",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "{{ $json.prompt }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "Tu es un générateur de texte strict pour un système automatisé. Tu ne dois JAMAIS ajouter de préambule, de conclusion, de markdown (pas de **gras**, pas de titres, pas de ```code```), ni aucune explication de ta part. Tu réponds uniquement dans le format exact demandé par l'utilisateur, sans aucun texte supplémentaire avant ou après. Si l'utilisateur demande un nombre précis de lignes, tu dois produire exactement ce nombre, ni plus ni moins."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        768,
+        0
+      ],
+      "id": "fb574928-3d02-46c9-89f2-2e1bc5b3e92f",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": "llama3.2:latest",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        768,
+        208
+      ],
+      "id": "70f1d4d9-2f39-41f6-9a7c-b1c646bd5d0c",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "zjhaucxx4xW0xIf3",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "raizentizen@gmail.com",
+        "subject": "=📊 Rapport Hebdomadaire BCP — {{ $now.toISO().substring(0, 10) }}",
+        "message": "={{ $json.rapport_full_html }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1248,
+        0
+      ],
+      "id": "9094e348-bbac-4b31-9f1d-b5cfa80790e8",
+      "name": "Send a message",
+      "webhookId": "d74deaf4-5890-4fd5-b188-d18d9863a80a",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "5kFAnOHmYB3tIPt2",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE: Code in JavaScript1  (VERSION FINALE)\n// Récupère les recommandations du LLM et les données fiables\n// du Code 1, reconstruit le rapport complet en HTML.\n//\n// Reproduit EXACTEMENT la maquette validée :\n// - Tableau des 17 agences (toutes catégories), trié de la\n//   moins bonne à la meilleure.\n// - AGENCE la mieux classée mise en valeur en doré avec 🏆.\n// - \"Probabilité d'atteinte de l'objectif\" partout au lieu de\n//   \"Confiance\".\n// - Légende / note de bas de page avec les seuils.\n// - Pas de ligne \"dashboard Power BI\" (envoyé séparément).\n// ============================================================\n\n// --- 1. Récupérer les données fiables de Code 1 ---\nlet baseData = null;\nconst possibleNames = ['Code in JavaScript', 'Code', 'Code1', 'Code in JavaScript1'];\n\nfor (const name of possibleNames) {\n  try {\n    const node = $(name);\n    if (node && node.first()) {\n      baseData = node.first().json;\n      break;\n    }\n  } catch (e) {\n    continue;\n  }\n}\n\nif (!baseData) {\n  baseData = $input.first().json;\n}\n\nconst needed = ['total_on_track', 'total_at_risk', 'total_en_danger',\n                 'best_agence', 'best_confiance', 'worst_agence', 'worst_confiance', 'agences'];\n\nfor (const key of needed) {\n  if (baseData[key] === undefined) {\n    throw new Error(`Champ manquant dans Code 1 : \"${key}\". Champs disponibles : ${Object.keys(baseData).join(', ')}`);\n  }\n}\n\n// --- 2. Récupérer le texte brut du LLM ---\nconst llmInput = $input.first().json;\nconst rawText =\n  llmInput.text ??\n  llmInput.response ??\n  llmInput.output ??\n  llmInput.content ??\n  '';\n\n// --- 3. Extraire les 3 lignes de recommandations ---\nconst candidateLines = rawText\n  .split('\\n')\n  .map(l => l.trim())\n  .filter(l => l.startsWith('-') || l.startsWith('•'))\n  .map(l => l.replace(/^[-•]\\s*/, '').trim())\n  .filter(l => l.length > 10);\n\nconst bestLower = baseData.best_agence.toLowerCase();\nconst worstLower = baseData.worst_agence.toLowerCase();\n\nconst validLines = candidateLines.filter(line => {\n  const lower = line.toLowerCase();\n  return lower.includes(bestLower) || lower.includes(worstLower);\n});\n\nconst fallbacks = [\n  `Organiser un suivi rapproché avec l'équipe de ${baseData.worst_agence} pour identifier les blocages et améliorer la probabilité d'atteinte de l'objectif.`,\n  `Mettre en place un plan d'action à court terme pour ${baseData.worst_agence} avec des indicateurs hebdomadaires.`,\n  `Capitaliser sur les bonnes pratiques de ${baseData.best_agence} et les partager avec les autres agences.`\n];\n\nconst recs = [];\nfor (let i = 0; i < 3; i++) {\n  recs.push(validLines[i] || fallbacks[i]);\n}\n\n// --- 4. Construire le tableau complet des 17 agences ---\n// Trié de la probabilité la plus faible à la plus forte.\nconst agencesTriees = [...baseData.agences].sort((a, b) => a.confiance_moyenne - b.confiance_moyenne);\n\nfunction detailParType(details, typeLabel) {\n  const d = details.find(x => x.credit_type === typeLabel);\n  return d ? `${d.confiance}%` : '—';\n}\n\nfunction badgeCategorie(cat) {\n  if (cat === 'En danger') return '<span style=\"color:#CC0000;font-weight:bold;\">🔴 Danger</span>';\n  if (cat === 'A risque') return '<span style=\"color:#B8860B;font-weight:bold;\">🟡 À risque</span>';\n  return '<span style=\"color:#006400;font-weight:bold;\">🟢 Bonne voie</span>';\n}\n\nconst tableRows = agencesTriees.map((a, idx) => {\n  const bg = idx % 2 === 0 ? '#ffffff' : '#f7f7f7';\n  const conso = detailParType(a.details, 'Consommation');\n  const immo = detailParType(a.details, 'Immobilier');\n  const isBest = a.agence === baseData.best_agence;\n  const nameStyle = isBest\n    ? 'font-weight:bold;border-bottom:1px solid #eee;color:#B8860B;'\n    : 'font-weight:bold;border-bottom:1px solid #eee;';\n  const nameLabel = isBest ? `${a.agence} 🏆` : a.agence;\n\n  return `<tr style=\"background-color:${bg};\">\n    <td style=\"padding:8px 10px;${nameStyle}\">${nameLabel}</td>\n    <td style=\"padding:8px 10px;border-bottom:1px solid #eee;text-align:center;\">${a.confiance_moyenne}%</td>\n    <td style=\"padding:8px 10px;border-bottom:1px solid #eee;text-align:center;\">${conso}</td>\n    <td style=\"padding:8px 10px;border-bottom:1px solid #eee;text-align:center;\">${immo}</td>\n    <td style=\"padding:8px 10px;border-bottom:1px solid #eee;text-align:center;\">${badgeCategorie(a.categorie)}</td>\n  </tr>`;\n}).join('\\n');\n\nconst tableAgencesHtml = `\n<p style=\"font-size:16px;font-weight:bold;color:#003366;margin-top:20px;margin-bottom:8px;\">📊 Détail par Agence (${agencesTriees.length} agences)</p>\n<table style=\"width:100%;border-collapse:collapse;font-size:14px;margin-bottom:10px;\">\n  <thead>\n    <tr style=\"background-color:#003366;color:white;\">\n      <th style=\"padding:8px 10px;text-align:left;\">Agence</th>\n      <th style=\"padding:8px 10px;\">Probabilité d'atteinte objectif</th>\n      <th style=\"padding:8px 10px;\">Consommation</th>\n      <th style=\"padding:8px 10px;\">Immobilier</th>\n      <th style=\"padding:8px 10px;\">Statut</th>\n    </tr>\n  </thead>\n  <tbody>\n    ${tableRows}\n  </tbody>\n</table>`;\n\n// --- 5. Légende / note de bas de page ---\nconst legendeHtml = `\n<p style=\"font-size:12px;color:#777;margin-top:20px;padding-top:10px;border-top:1px dashed #ddd;\">\n  <strong>Légende :</strong>\n  🟢 En bonne voie (≥ 70%) &nbsp;|&nbsp;\n  🟡 À risque (40% – 69%) &nbsp;|&nbsp;\n  🔴 En danger (&lt; 40%)<br>\n  <em>La \"Probabilité d'atteinte de l'objectif\" est calculée par le modèle prédictif à partir des indicateurs de pipe et de réalisations partielles, moyennée sur les crédits Consommation et Immobilier.</em>\n</p>`;\n\n// --- 6. Construire le texte brut (fallback / logs) ---\nconst reportText =\n`Bonjour Directeur Régional,\n\nVoici le résumé des performances commerciales de cette semaine :\n\n🟢 Situation Globale\n- Agences en bonne voie : ${baseData.total_on_track}\n- Agences à risque : ${baseData.total_at_risk}\n- Agences en danger : ${baseData.total_en_danger}\n\n🏆 Top Performer\n- ${baseData.best_agence} — Probabilité d'atteinte objectif : ${baseData.best_confiance}%\n\n⚠️ À Surveiller en Priorité\n- ${baseData.worst_agence} — Probabilité d'atteinte objectif : ${baseData.worst_confiance}%\n\n📋 Recommandations\n- ${recs[0]}\n- ${recs[1]}\n- ${recs[2]}\n\nCordialement,\nSystème d'Alertes BCP`;\n\n// --- 7. Construire le HTML final ---\nconst fullHtml = `<!DOCTYPE html>\n<html>\n<body style=\"font-family:Arial,sans-serif;font-size:15px;line-height:1.8;color:#222;max-width:650px;margin:40px auto;padding:0;border:1px solid #e0e0e0;border-radius:8px;\">\n<div style=\"background-color:#003366;color:white;padding:15px 20px;border-radius:6px 6px 0 0;margin-bottom:20px;\">\n  <h2 style=\"margin:0;font-size:18px;\">📊 Rapport Hebdomadaire — Banque Populaire Béni Mellal</h2>\n</div>\n<div style=\"padding:0 25px 25px 25px;\">\n\n<p style=\"margin:6px 0;\">Bonjour Directeur Régional,</p>\n<p style=\"margin:6px 0;\">Voici le résumé des performances commerciales de cette semaine :</p>\n\n<p style=\"font-size:16px;font-weight:bold;color:#006400;margin-top:20px;margin-bottom:5px;\">🟢 Situation Globale</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• Agences en bonne voie : ${baseData.total_on_track}</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• Agences à risque : ${baseData.total_at_risk}</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• Agences en danger : ${baseData.total_en_danger}</p>\n\n<p style=\"font-size:16px;font-weight:bold;color:#B8860B;margin-top:20px;margin-bottom:5px;\">🏆 Top Performer</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• ${baseData.best_agence} — Probabilité d'atteinte objectif : ${baseData.best_confiance}%</p>\n\n<p style=\"font-size:16px;font-weight:bold;color:#CC0000;margin-top:20px;margin-bottom:5px;\">⚠️ À Surveiller en Priorité</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• ${baseData.worst_agence} — Probabilité d'atteinte objectif : ${baseData.worst_confiance}%</p>\n\n${tableAgencesHtml}\n\n<p style=\"font-size:16px;font-weight:bold;color:#003366;margin-top:20px;margin-bottom:5px;\">📋 Recommandations</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• ${recs[0]}</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• ${recs[1]}</p>\n<p style=\"margin:4px 0;padding-left:20px;\">• ${recs[2]}</p>\n\n${legendeHtml}\n\n<p style=\"margin:14px 0 4px 0;color:#666;\">Cordialement,</p>\n<p style=\"margin:0;color:#666;\">Système d'Alertes BCP</p>\n\n</div>\n<div style=\"margin-top:10px;padding:15px 25px;border-top:1px solid #e0e0e0;font-size:12px;color:#999;border-radius:0 0 6px 6px;background-color:#f9f9f9;\">\n  Ce rapport est généré automatiquement par le Système d'Alertes IA — BCP Région Béni Mellal\n</div>\n</body>\n</html>`;\n\n// --- 8. Retourner ---\nreturn [{\n  json: {\n    rapport_texte: reportText,\n    rapport_full_html: fullHtml,\n    recommandations_source: validLines.length >= 3 ? 'LLM' : 'fallback',\n    nb_agences_table: agencesTriees.length\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1088,
+        0
+      ],
+      "id": "0ed9e62d-9d9b-476e-a165-b2c86cc7ec46",
+      "name": "Code in JavaScript1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read/Write Files from Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read/Write Files from Disk": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "b7e2e554-8d28-46f8-b1f7-fdb1c4926c47",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "f824768480f68f1c48dcab694d9c99c8fbdc39d2c9955854e47f0168f05748a9"
+  },
+  "nodeGroups": [],
+  "id": "mjiSRT3laS5BZMgm",
+  "tags": []
+}
